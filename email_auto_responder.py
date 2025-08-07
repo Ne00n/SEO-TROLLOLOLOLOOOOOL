@@ -19,20 +19,38 @@ Author: Roo
 import imaplib
 import smtplib
 import ssl
-import email
 import re
 import json
 import os
 import time
+import logging
+from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.message import EmailMessage
+from email.utils import parsedate_to_datetime, parseaddr
 from datetime import datetime, time as dt_time, timedelta
 from typing import List, Dict, Any, Tuple, Optional
 import requests
 from zoneinfo import ZoneInfo
+import sys
+
+# Fallback for environments where email.policy isn't available on the email module attribute
+try:
+    from email import policy as email_policy
+    DEFAULT_EMAIL_POLICY = email_policy.default
+except Exception:
+    # Use compat by parsing without explicit policy
+    email_policy = None
+    DEFAULT_EMAIL_POLICY = None
 
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 SEEN_LIMIT = int(os.environ.get("FETCH_LIMIT", "50"))
+
+# Logging config
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format=LOG_FORMAT)
+logger = logging.getLogger("auto_responder")
 
 # Env config with defaults
 IMAP_HOST = os.environ.get("IMAP_HOST", "")
@@ -52,7 +70,8 @@ KEYWORDS = [k.strip() for k in os.environ.get("KEYWORDS", "urgent,asap,help,supp
 
 # Ollama
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1:latest")
+# Default to a widely available small model; override via .env
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:4b")
 OLLAMA_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "60"))
 
 # Business hours
@@ -91,6 +110,7 @@ def save_state(state: Dict[str, Any]) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
     os.replace(tmp, STATE_FILE)
+    logger.debug(f"State saved to {STATE_FILE}: seen={len(state.get('seen_ids', []))}, replied={len(state.get('replied_ids', []))}")
 
 
 def decode_mime_header(value: Optional[str]) -> str:
@@ -102,9 +122,9 @@ def decode_mime_header(value: Optional[str]) -> str:
         return value
 
 
-def get_message_id(msg: email.message.Message) -> str:
+def get_message_id(msg: "EmailMessage") -> str:
     mid = msg.get("Message-ID") or msg.get("Message-Id") or ""
-    return mid.strip()
+    return (mid or "").strip()
 
 
 def is_business_day(dt: datetime) -> bool:
@@ -147,12 +167,15 @@ def in_business_hours(now: Optional[datetime] = None) -> bool:
     tz = ZoneInfo(TZ_NAME)
     now = now or datetime.now(tz)
     if not is_business_day(now):
+        logger.debug(f"Outside business day ({BUSINESS_DAYS}), now={now.isoformat()}")
         return False
     sh, sm = parse_hhmm(BUSINESS_START)
     eh, em = parse_hhmm(BUSINESS_END)
     start = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
     end = now.replace(hour=eh, minute=em, second=0, microsecond=0)
-    return start <= now <= end
+    inside = start <= now <= end
+    logger.debug(f"Business hours check: {start.time()} - {end.time()}, now={now.time()}, inside={inside}")
+    return inside
 
 
 def sanitize_text(text: str) -> str:
@@ -169,7 +192,7 @@ def sanitize_text(text: str) -> str:
     return text.strip()
 
 
-def message_to_plaintext(msg: email.message.Message) -> str:
+def message_to_plaintext(msg: "EmailMessage") -> str:
     # Prefer text/plain, fallback to text/html stripped
     parts: List[str] = []
     if msg.is_multipart():
@@ -234,19 +257,27 @@ def subject_matches(subject: str) -> bool:
 
 
 def ensure_starttls_imap(host: str, port: int, user: str, password: str) -> imaplib.IMAP4:
+    logger.debug(f"Connecting IMAP STARTTLS to {host}:{port} as {user}")
     imap = imaplib.IMAP4(host=host, port=port)
-    imap.starttls(ssl_context=ssl.create_default_context())
-    imap.login(user, password)
+    typ, resp = imap.starttls(ssl_context=ssl.create_default_context())
+    logger.debug(f"IMAP STARTTLS response: {typ} {resp}")
+    typ, resp = imap.login(user, password)
+    logger.debug(f"IMAP login response: {typ}")
     return imap
 
 
 def ensure_starttls_smtp(host: str, port: int, user: str, password: str) -> smtplib.SMTP:
+    logger.debug(f"Connecting SMTP STARTTLS to {host}:{port} as {user}")
     smtp = smtplib.SMTP(host=host, port=port, timeout=60)
-    smtp.ehlo()
-    smtp.starttls(context=ssl.create_default_context())
-    smtp.ehlo()
+    code, msg = smtp.ehlo()
+    logger.debug(f"SMTP EHLO pre-STARTTLS: {code} {msg}")
+    code, msg = smtp.starttls(context=ssl.create_default_context())
+    logger.debug(f"SMTP STARTTLS: {code} {msg}")
+    code, msg = smtp.ehlo()
+    logger.debug(f"SMTP EHLO post-STARTTLS: {code} {msg}")
     if user:
         smtp.login(user, password)
+        logger.debug("SMTP login successful")
     return smtp
 
 
@@ -261,51 +292,92 @@ def send_email(to_addr: str, subject: str, body: str, in_reply_to: Optional[str]
         msg["References"] = references
     msg.set_content(body)
 
+    logger.info(f"Sending email to={to_addr} subject={subject!r} in_reply_to={bool(in_reply_to)}")
     with ensure_starttls_smtp(SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS) as smtp:
         smtp.send_message(msg)
+    logger.debug("Email sent successfully")
 
 
-def fetch_latest_messages() -> List[Tuple[bytes, email.message.Message]]:
+def fetch_latest_messages() -> List[Tuple[bytes, EmailMessage]]:
     with ensure_starttls_imap(IMAP_HOST, IMAP_PORT, IMAP_USER, IMAP_PASS) as imap:
-        imap.select("INBOX")
+        typ, mailbox_info = imap.select("INBOX")
+        logger.debug(f"IMAP select INBOX: {typ} {mailbox_info}")
         # Search all; could refine e.g., UNSEEN
         typ, data = imap.search(None, "ALL")
+        logger.debug(f"IMAP search ALL: {typ} count={len(data[0].split()) if typ == 'OK' and data and data[0] else 0}")
         if typ != "OK" or not data or not data[0]:
             return []
         ids = data[0].split()
         latest_ids = ids[-SEEN_LIMIT:]
-        messages = []
+        logger.info(f"Fetching {len(latest_ids)} latest emails (limit={SEEN_LIMIT})")
+        messages: List[Tuple[bytes, EmailMessage]] = []
         for uid in reversed(latest_ids):
             typ, msg_data = imap.fetch(uid, "(RFC822)")
             if typ == "OK" and msg_data and isinstance(msg_data[0], tuple):
                 raw = msg_data[0][1]
-                msg = email.message_from_bytes(raw, policy=email.policy.default)
+                if DEFAULT_EMAIL_POLICY is not None:
+                    msg = message_from_bytes(raw, policy=DEFAULT_EMAIL_POLICY)
+                else:
+                    msg = message_from_bytes(raw)
+                # Ensure type is EmailMessage
+                if not isinstance(msg, EmailMessage):
+                    # Convert to EmailMessage if possible by rebuilding
+                    em = EmailMessage()
+                    for k, v in msg.items():
+                        em[k] = v
+                    try:
+                        em.set_content(msg.get_content())
+                    except Exception:
+                        payload = msg.get_payload(decode=True) or b""
+                        charset = getattr(msg, "get_content_charset", lambda: "utf-8")() or "utf-8"
+                        try:
+                            em.set_content(payload.decode(charset, errors="replace"))
+                        except Exception:
+                            em.set_content("")
+                    msg = em
+                subj = decode_mime_header(msg.get("Subject"))
+                frm = decode_mime_header(msg.get("From"))
+                logger.debug(f"Fetched UID={uid.decode()} MID={get_message_id(msg)} Subject={subj!r} From={frm!r}")
                 messages.append((uid, msg))
+            else:
+                logger.warning(f"Failed to fetch UID={uid.decode()} typ={typ}")
         return messages
 
 
 def ollama_generate_reply(prompt: str) -> str:
-    # Non-streaming generate endpoint
-    url = f"{OLLAMA_BASE_URL}/api/generate"
+    """
+    Generate a reply using Ollama /api/generate (non-streaming).
+    Adds extra logging to help debug payload/endpoint issues.
+    """
+    def _sanitize_out(text: str) -> str:
+        text = sanitize_text(text)
+        # Extra guard: remove bracketed placeholders like [NAME], {placeholder}, <placeholder>
+        text = re.sub(r"\[[^\]]+\]", "", text)
+        text = re.sub(r"\{[^}]+\}", "", text)
+        text = re.sub(r"<[^>]+>", "", text)
+        return text.strip()
+
+    url = f"{OLLAMA_BASE_URL.rstrip('/')}/api/generate"
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": prompt,
         "stream": False,
-        # safety/system style instruction to avoid placeholders
+        # Common options supported by Ollama
         "options": {
-            "temperature": 0.7,
+            "temperature": 0.7
         }
     }
-    r = requests.post(url, json=payload, timeout=OLLAMA_TIMEOUT)
+    logger.debug(f"Ollama generate URL={url}")
+    logger.debug(f"Ollama model={OLLAMA_MODEL}, prompt_len={len(prompt)}")
+    # Explicitly prevent any GET due to proxies/misconfig by forcing method and verifying
+    r = requests.request("POST", url, json=payload, timeout=OLLAMA_TIMEOUT)
+    logger.debug(f"Ollama status={r.status_code}, content-type={r.headers.get('content-type')}")
     r.raise_for_status()
     data = r.json()
+    # Standard response schema from /api/generate contains 'response'
     text = data.get("response", "") or data.get("text", "")
-    text = sanitize_text(text)
-    # Extra guard: remove bracketed placeholders like [NAME], {placeholder}, <placeholder>
-    text = re.sub(r"\[[^\]]+\]", "", text)
-    text = re.sub(r"\{[^}]+\}", "", text)
-    text = re.sub(r"<[^>]+>", "", text)
-    return text.strip()
+    logger.debug(f"Ollama response text length={len(text)}")
+    return _sanitize_out(text)
 
 
 def build_ollama_prompt(original_subject: str, original_from: str, original_body: str) -> str:
@@ -336,8 +408,8 @@ def build_ollama_prompt(original_subject: str, original_from: str, original_body
     return prompt
 
 
-def collect_unreplied_queue(messages: List[Tuple[bytes, email.message.Message]], state: Dict[str, Any]) -> List[email.message.Message]:
-    queue: List[email.message.Message] = []
+def collect_unreplied_queue(messages: List[Tuple[bytes, EmailMessage]], state: Dict[str, Any]) -> List[EmailMessage]:
+    queue: List[EmailMessage] = []
     for _, msg in messages:
         mid = get_message_id(msg)
         subject = decode_mime_header(msg.get("Subject"))
@@ -351,25 +423,32 @@ def collect_unreplied_queue(messages: List[Tuple[bytes, email.message.Message]],
     return queue
 
 
-def reply_to_message(msg: email.message.Message, use_ollama: bool, state: Dict[str, Any]) -> None:
+def reply_to_message(msg: "EmailMessage", use_ollama: bool, state: Dict[str, Any]) -> None:
     mid = get_message_id(msg)
     if not mid:
+        logger.warning("Skipping reply: missing Message-ID")
         return
 
     subject = decode_mime_header(msg.get("Subject"))
     from_header = decode_mime_header(msg.get("From"))
     # Extract email address for reply
-    addr = email.utils.parseaddr(from_header)[1]
+    addr = parseaddr(from_header)[1]
     if not addr:
+        logger.warning(f"Skipping reply for MID={mid}: could not parse a reply address from From={from_header!r}")
         return
 
+    logger.info(f"Preparing reply for MID={mid} to={addr} subject={subject!r} use_ollama={use_ollama}")
     original_body = message_to_plaintext(msg)
+    logger.debug(f"Original body (sanitized, length={len(original_body)} chars)")
 
     if use_ollama:
         prompt = build_ollama_prompt(subject, from_header, original_body)
+        logger.debug(f"Ollama prompt length={len(prompt)}")
         try:
             body = ollama_generate_reply(prompt)
+            logger.debug(f"Ollama reply length={len(body)}")
         except Exception as e:
+            logger.exception(f"Ollama generation failed for MID={mid}: {e}")
             body = ("Thank you for your email. We encountered an internal issue generating an automated reply. "
                     "We will follow up shortly with a detailed response.")
     else:
@@ -385,6 +464,7 @@ def reply_to_message(msg: email.message.Message, use_ollama: bool, state: Dict[s
     rep = state.setdefault("replied_ids", [])
     if mid not in rep:
         rep.append(mid)
+        logger.debug(f"Marked replied MID={mid}")
 
 
 def main() -> None:
@@ -394,18 +474,27 @@ def main() -> None:
         if not globals().get(key):
             missing.append(key)
     if missing:
-        print(f"Configuration missing environment variables: {', '.join(missing)}")
-        print("Create a .env file based on .env.example and re-run.")
+        logger.error(f"Configuration missing environment variables: {', '.join(missing)}")
+        logger.error("Create a .env file based on .env.example and re-run.")
         return
 
+    logger.info("Starting email auto responder")
+    logger.info(f"Config: IMAP_HOST={IMAP_HOST}, IMAP_PORT={IMAP_PORT}, SMTP_HOST={SMTP_HOST}, SMTP_PORT={SMTP_PORT}, FETCH_LIMIT={SEEN_LIMIT}")
+    logger.info(f"Ollama: base={OLLAMA_BASE_URL}, model={OLLAMA_MODEL}, timeout={OLLAMA_TIMEOUT}s")
+    logger.info(f"Business hours: {BUSINESS_DAYS} {BUSINESS_START}-{BUSINESS_END} TZ={TZ_NAME}")
+    logger.info(f"Keywords: {KEYWORDS}")
+
     state = load_state()
+    logger.debug(f"Loaded state: seen={len(state.get('seen_ids', []))}, replied={len(state.get('replied_ids', []))}")
 
     # Fetch latest messages
     try:
         messages = fetch_latest_messages()
     except Exception as e:
-        print(f"IMAP fetch failed: {e}")
+        logger.exception(f"IMAP fetch failed: {e}")
         return
+
+    logger.info(f"Fetched {len(messages)} messages")
 
     # Update seen_ids
     for _, msg in messages:
@@ -419,9 +508,11 @@ def main() -> None:
         subject = decode_mime_header(msg.get("Subject"))
         if subject_matches(subject):
             matching_msgs.append(msg)
+    logger.info(f"Subject-matching messages: {len(matching_msgs)}")
 
     # Determine business hours
     inside = in_business_hours()
+    logger.info(f"In business hours: {inside}")
 
     if not inside:
         # Outside hours: reply standard to any matching not already replied
@@ -433,14 +524,15 @@ def main() -> None:
                 reply_to_message(msg, use_ollama=False, state=state)
                 time.sleep(0.5)
             except Exception as e:
-                print(f"Failed to send out-of-hours reply for {mid}: {e}")
+                logger.exception(f"Failed to send out-of-hours reply for {mid}: {e}")
     else:
         # Inside hours: queue includes prior unreplied matching emails too
         queue = collect_unreplied_queue(messages, state)
+        logger.info(f"Reply queue (inside hours): {len(queue)}")
         # Ensure chronological by email Date header (oldest first)
-        def parse_date(m: email.message.Message) -> float:
+        def parse_date(m: "EmailMessage") -> float:
             try:
-                dt = email.utils.parsedate_to_datetime(m.get("Date"))
+                dt = parsedate_to_datetime(m.get("Date"))
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=ZoneInfo(TZ_NAME))
                 return dt.timestamp()
@@ -456,10 +548,10 @@ def main() -> None:
                 reply_to_message(msg, use_ollama=True, state=state)
                 time.sleep(0.8)
             except Exception as e:
-                print(f"Failed to send business-hours reply for {mid}: {e}")
+                logger.exception(f"Failed to send business-hours reply for {mid}: {e}")
 
     save_state(state)
-    print("Done.")
+    logger.info("Done.")
 
 
 if __name__ == "__main__":
